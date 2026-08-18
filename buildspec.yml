@@ -1,0 +1,55 @@
+# CodeBuild buildspec for the tf-smvp-aws Atlantis image.
+#
+# The in-account build path: after handoff the customer owns this pipeline and
+# builds the image in their own account rather than pulling one we publish. It
+# builds the same Containerfile as the Gitea and GitHub workflows, so the result
+# is the image we would have shipped, not an approximation of it.
+#
+# Required environment variables (set on the CodeBuild project):
+#   AWS_DEFAULT_REGION  - the account's region
+#   AWS_ACCOUNT_ID      - the account ID
+#   ECR_REPOSITORY_URI  - Atlantis ECR repo URL
+#
+# Optional:
+#   IMAGE_TAG           - override the tag. Defaults to the commit SHA, which is
+#                         what the ECS task definition should pin: it names the
+#                         source that produced the image, and unlike a moving tag
+#                         it forces a task definition change, without which ECS
+#                         has nothing to reconcile and the rollout silently does
+#                         not happen.
+#
+# The project must run in privileged mode -- it builds a container.
+
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to ECR ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+
+  # Resolve, build and push in one block. A shell variable set in one phase is
+  # not guaranteed to survive into the next, so IMAGE_TAG is derived and used
+  # without crossing a phase boundary.
+  build:
+    commands:
+      - |
+        set -eu
+
+        # CODEBUILD_RESOLVED_SOURCE_VERSION is the full commit SHA for a git
+        # source. It is empty on a NO_SOURCE project, which has no commit to
+        # name -- fail there rather than fall back to :latest and produce an
+        # image nothing can pin.
+        IMAGE_TAG="${IMAGE_TAG:-${CODEBUILD_RESOLVED_SOURCE_VERSION:-}}"
+        if [ -z "$IMAGE_TAG" ]; then
+          echo "No IMAGE_TAG and no resolved source version. Set IMAGE_TAG" >&2
+          echo "explicitly, or give the project a git source." >&2
+          exit 1
+        fi
+
+        echo "Building $ECR_REPOSITORY_URI:$IMAGE_TAG"
+        docker build -f Containerfile -t "$ECR_REPOSITORY_URI:$IMAGE_TAG" .
+        docker push "$ECR_REPOSITORY_URI:$IMAGE_TAG"
+
+        echo "Pin this as atlantis_image:"
+        echo "  $ECR_REPOSITORY_URI:$IMAGE_TAG"
